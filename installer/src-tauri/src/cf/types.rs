@@ -1,14 +1,35 @@
 //! Serde types for the Cloudflare v4 API envelope and the handful of
 //! resources the installer provisions.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Deserialize)]
 pub struct Envelope<T> {
+    // The classic v4 envelope always includes `success`, but some newer
+    // endpoints (Workers assets: assets-upload-session, /assets/upload) return
+    // `{ "result": … }` with no `success`. Default to true when absent — a real
+    // error still carries `success: false` and/or a non-empty `errors` array.
+    #[serde(default = "default_true")]
     pub success: bool,
-    #[serde(default)]
+    // Cloudflare sometimes sends `"errors": null` rather than omitting it or
+    // sending `[]`; treat null the same as missing/empty.
+    #[serde(default, deserialize_with = "null_default")]
     pub errors: Vec<CfError>,
     pub result: Option<T>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Deserializes a value that may be `null` into its `Default` — for fields
+/// Cloudflare sends as `null` instead of an empty collection.
+pub fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,7 +72,8 @@ pub struct SubdomainResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadSession {
     pub jwt: Option<String>,
-    #[serde(default)]
+    // Cloudflare returns `"buckets": null` when there's nothing to upload.
+    #[serde(default, deserialize_with = "null_default")]
     pub buckets: Vec<Vec<String>>,
 }
 

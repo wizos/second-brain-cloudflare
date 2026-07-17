@@ -44,19 +44,40 @@ impl CfClient {
 
     /// Sends a request (rebuilt per attempt so multipart bodies can retry) and
     /// parses the Cloudflare envelope. Returns the envelope `result`, which
-    /// some endpoints legitimately leave null.
+    /// some endpoints legitimately leave null. The account token is attached as
+    /// the bearer.
     async fn send<T: DeserializeOwned>(
         &self,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Option<T>, CfApiError> {
+        self.send_impl(build, true).await
+    }
+
+    /// Like [`send`], but does not attach the account token — the closure must
+    /// supply its own `Authorization`. Used for the asset upload, which
+    /// authenticates with the upload-session JWT; attaching the account token
+    /// too would send two `Authorization` headers and Cloudflare's edge rejects
+    /// that with a 400.
+    async fn send_no_auth<T: DeserializeOwned>(
+        &self,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Option<T>, CfApiError> {
+        self.send_impl(build, false).await
+    }
+
+    async fn send_impl<T: DeserializeOwned>(
+        &self,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+        account_auth: bool,
+    ) -> Result<Option<T>, CfApiError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let sent = build(&self.http)
-                .bearer_auth(&self.token)
-                .timeout(Duration::from_secs(60))
-                .send()
-                .await;
+            let mut req = build(&self.http);
+            if account_auth {
+                req = req.bearer_auth(&self.token);
+            }
+            let sent = req.timeout(Duration::from_secs(60)).send().await;
             let retry_wait = Duration::from_millis(800 * (attempt as u64) * (attempt as u64));
             match sent {
                 Err(e) => {
@@ -72,17 +93,24 @@ impl CfClient {
                     let retryable = status == 429 || status >= 500;
                     let body = resp.text().await.unwrap_or_default();
                     match serde_json::from_str::<Envelope<T>>(&body) {
-                        Ok(env) if env.success => return Ok(env.result),
+                        // Success = no errors reported. `success` defaults true
+                        // for endpoints that omit it (Workers assets).
+                        Ok(env) if env.success && env.errors.is_empty() => {
+                            return Ok(env.result)
+                        }
                         Ok(env) => {
                             if !retryable || attempt >= MAX_ATTEMPTS {
                                 return Err(CfApiError::from_errors(&env.errors));
                             }
                         }
-                        Err(_) => {
+                        Err(parse_err) => {
                             if !retryable || attempt >= MAX_ATTEMPTS {
                                 let mut short = body;
-                                short.truncate(300);
-                                return Err(CfApiError::Http { status, body: short });
+                                short.truncate(600);
+                                return Err(CfApiError::Http {
+                                    status,
+                                    body: format!("[unparseable response: {parse_err}] {short}"),
+                                });
                             }
                         }
                     }
@@ -226,7 +254,7 @@ impl CfClient {
             let jwt = session_jwt.clone();
             let upload_url = upload_url.clone();
             let uploaded: Option<UploadedBucket> = self
-                .send(move |h| {
+                .send_no_auth(move |h| {
                     let mut form = Form::new();
                     for (hash, b64, mime) in &parts {
                         let part = Part::text(b64.clone())
@@ -258,6 +286,12 @@ impl CfClient {
     ) -> Result<(), CfApiError> {
         let url = self.url(&self.account_path(&format!("/workers/scripts/{script}")));
         let metadata_str = metadata.to_string();
+        log::info!(
+            "deploy_worker: {} bytes of code, {} bytes of metadata, {} bindings",
+            worker_js.len(),
+            metadata_str.len(),
+            metadata.get("bindings").and_then(|b| b.as_array()).map_or(0, |a| a.len()),
+        );
         self.send::<serde_json::Value>(move |h| {
             let form = Form::new()
                 .part(
@@ -476,6 +510,36 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn envelope_parses_assets_response_without_success_field() {
+        // The Workers assets-upload-session endpoint returns `{ "result": … }`
+        // with no top-level `success` — this used to fail parsing and abort the
+        // whole deploy. It must now parse and be treated as a success.
+        let body = r#"{"result":{"jwt":"cfwau_abc","buckets":[["hash1","hash2"]],"manifest_id":"m-1"}}"#;
+        let env: Envelope<UploadSession> = serde_json::from_str(body).unwrap();
+        assert!(env.success, "missing `success` must default to true");
+        assert!(env.errors.is_empty());
+        let session = env.result.unwrap();
+        assert_eq!(session.jwt.as_deref(), Some("cfwau_abc"));
+        assert_eq!(session.buckets, vec![vec!["hash1".to_string(), "hash2".to_string()]]);
+
+        // The completion response (no buckets) must also parse.
+        let done: Envelope<UploadSession> =
+            serde_json::from_str(r#"{"result":{"jwt":"cfwau_done"}}"#).unwrap();
+        assert!(done.success);
+        assert!(done.result.unwrap().buckets.is_empty());
+
+        // Cloudflare sends `null` (not `[]` or missing) for empty collections;
+        // both `errors: null` and `buckets: null` must be tolerated.
+        let nulls: Envelope<UploadSession> = serde_json::from_str(
+            r#"{"result":{"jwt":"cfwau_x","buckets":null},"success":true,"errors":null,"messages":null}"#,
+        )
+        .unwrap();
+        assert!(nulls.success);
+        assert!(nulls.errors.is_empty());
+        assert!(nulls.result.unwrap().buckets.is_empty());
     }
 
     #[tokio::test]
